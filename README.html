@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fluent Bit → Splunk + Prometheus + Grafana (Docker demo)</title>
+<style>
+:root{--bg:#fff;--fg:#1f2328;--muted:#59636e;--border:#d1d9e0;--code:#f6f8fa;--link:#0969da}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--border:#3d444d;--code:#151b23;--link:#4493f8}}
+body{background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:0}
+main{max-width:900px;margin:0 auto;padding:32px 24px 64px}
+h1,h2{border-bottom:1px solid var(--border);padding-bottom:.3em}h1{font-size:2em}h2{font-size:1.5em;margin-top:32px}h3{margin-top:24px}
+a{color:var(--link)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:85%}
+code{background:var(--code);padding:.2em .4em;border-radius:6px}
+pre{background:var(--code);padding:16px;border-radius:6px;overflow:auto;line-height:1.45}pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid var(--border);padding:6px 13px;text-align:left}th{background:var(--code)}
+blockquote{margin:0;padding:0 1em;color:var(--muted);border-left:.25em solid var(--border)}
+.muted{color:var(--muted)}
+</style></head><body><main>
+
+<h1>Fluent Bit → Splunk + Prometheus + Grafana</h1>
+<p class="muted">One <code>docker compose up</code> demo: Fluent Bit tails app logs into Splunk and scrapes app metrics for Prometheus, which Grafana charts.</p>
+
+<h2>Architecture</h2>
+<pre><code>orders ──┐  JSON logs  (shared volume /logs)           ┌─► Splunk HEC :8088  ─► Splunk Web :8000
+         ├──────────────────────────► Fluent Bit ──────┤
+payments ┘  /metrics (HTTP :8000)       (tail +         └─► prometheus_exporter :2021
+                                      prometheus_scrape)            ▲
+                                                          Prometheus :9090 scrapes
+                                                                    │
+                                                              Grafana :3000</code></pre>
+<p>Fluent Bit is the only collector. Apps know nothing about Splunk or Prometheus.</p>
+
+<h2>Run it</h2>
+<pre><code>docker compose up -d --build
+docker compose ps          # splunk takes 2-4 min to become healthy; fluent-bit waits for it
+docker compose logs -f fluent-bit</code></pre>
+
+<table>
+<tr><th>UI</th><th>URL</th><th>Login</th></tr>
+<tr><td>Splunk Web</td><td><a href="http://localhost:8000">localhost:8000</a></td><td><code>admin</code> / <code>Chang3Me!</code></td></tr>
+<tr><td>Grafana</td><td><a href="http://localhost:3000">localhost:3000</a> → dashboard "Fluent Bit Demo"</td><td><code>admin</code> / <code>admin</code></td></tr>
+<tr><td>Prometheus</td><td><a href="http://localhost:9090/targets">localhost:9090/targets</a></td><td>none</td></tr>
+<tr><td>Fluent Bit metrics</td><td><a href="http://localhost:2021/metrics">localhost:2021/metrics</a></td><td>none</td></tr>
+</table>
+
+<h2>What to show in the demo</h2>
+<h3>1. Logs in Splunk</h3>
+<p>Search & Reporting, then:</p>
+<pre><code>index=main sourcetype="app:json" | stats count by app, level
+index=main level=ERROR | timechart span=10s count by app
+index=main app=payments | stats avg(duration_ms) p95(duration_ms) by path</code></pre>
+<h3>2. Metrics in Prometheus / Grafana</h3>
+<pre><code>sum by (app)(rate(app_requests_total[1m]))
+histogram_quantile(0.95, sum by (le,app)(rate(app_request_duration_seconds_bucket[1m])))
+sum by (name)(rate(fluentbit_output_proc_records_total[1m]))   # Fluent Bit itself</code></pre>
+<h3>3. Resilience (good live moment)</h3>
+<pre><code>docker compose stop splunk      # Fluent Bit logs retries; metrics keep flowing
+docker compose start splunk     # buffered logs are delivered, nothing lost (Retry_Limit False)</code></pre>
+<p>Watch <code>fluentbit_output_retries_total</code> climb in Grafana/Prometheus while Splunk is down. For real durability add <code>storage.type filesystem</code> to the tail input.</p>
+
+<h2>How the pieces work</h2>
+<table>
+<tr><th>Piece</th><th>Config</th><th>Notes</th></tr>
+<tr><td>Log input</td><td><code>tail</code> on <code>/logs/*.log</code></td><td>Apps write JSON lines to a shared volume. For real containers, tail <code>/var/lib/docker/containers/*/*-json.log</code> with the <code>docker</code> parser, or use the <code>forward</code> input with Docker's fluentd log driver.</td></tr>
+<tr><td>Metrics input</td><td><code>prometheus_scrape</code> ×2, <code>fluentbit_metrics</code></td><td>Fluent Bit pulls <code>/metrics</code> from each app every 5s. Fluent Bit's own metrics ride the same pipeline.</td></tr>
+<tr><td>Logs output</td><td><code>splunk</code> (HEC)</td><td>Token set via <code>SPLUNK_HEC_TOKEN</code>; <code>TLS.Verify Off</code> because Splunk uses a self-signed cert.</td></tr>
+<tr><td>Metrics output</td><td><code>prometheus_exporter</code> on :2021</td><td>Prometheus scrapes Fluent Bit, with <code>honor_labels: true</code> to keep the <code>app</code> label.</td></tr>
+</table>
+
+<h3>Alternative: push metrics with remote write</h3>
+<p>Instead of the exporter, push straight to Prometheus. Start Prometheus with <code>--web.enable-remote-write-receiver</code> and replace the metrics output:</p>
+<pre><code>[OUTPUT]
+    Name   prometheus_remote_write
+    Match  metrics.*
+    Host   prometheus
+    Port   9090
+    Uri    /api/v1/write</code></pre>
+
+<h2>Troubleshooting</h2>
+<table>
+<tr><th>Symptom</th><th>Fix</th></tr>
+<tr><td>Splunk never healthy / slow</td><td>Image is amd64 only; on Apple Silicon it runs emulated and can take 5+ min. Needs ~4 GB RAM.</td></tr>
+<tr><td>No logs in Splunk</td><td><code>docker compose logs fluent-bit</code>: look for HTTP 400/403 (token mismatch) or connection refused. Check <code>index=main</code> and time range "Last 15 minutes".</td></tr>
+<tr><td>Prometheus target down</td><td>Open <code>localhost:2021/metrics</code>; empty means the scrape inputs can't reach <code>orders:8000</code>/<code>payments:8000</code>.</td></tr>
+<tr><td>Splunk license prompt</td><td>Splunk's env var for accepting terms changes between releases; see the image's README on Docker Hub if <code>SPLUNK_GENERAL_TERMS</code> is rejected.</td></tr>
+</table>
+
+<h2>Clean up</h2>
+<pre><code>docker compose down -v</code></pre>
+
+<blockquote>Demo credentials only. Change passwords and enable TLS verification before anything real.</blockquote>
+</main></body></html>

@@ -1,0 +1,73 @@
+name: fluentbit-demo
+
+x-app: &app
+  build: ./app
+  volumes:
+    - applogs:/logs
+
+services:
+  orders:
+    <<: *app
+    environment:
+      APP_NAME: orders
+
+  payments:
+    <<: *app
+    environment:
+      APP_NAME: payments
+
+  fluent-bit:
+    image: fluent/fluent-bit:latest
+    command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
+    environment:
+      SPLUNK_HEC_TOKEN: demo-hec-token
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - applogs:/logs:ro
+    ports:
+      - "2020:2020"   # Fluent Bit HTTP API
+      - "2021:2021"   # Prometheus exporter
+    depends_on:
+      splunk:
+        condition: service_healthy
+      orders:
+        condition: service_started
+      payments:
+        condition: service_started
+
+  splunk:
+    image: splunk/splunk:latest
+    platform: linux/amd64        # no arm64 image; runs under emulation on Apple Silicon
+    environment:
+      SPLUNK_START_ARGS: --accept-license
+      SPLUNK_GENERAL_TERMS: --accept-sgt-current-at-splunk-com
+      SPLUNK_PASSWORD: Chang3Me!
+      SPLUNK_HEC_TOKEN: demo-hec-token
+    ports:
+      - "8000:8000"   # Splunk Web
+      - "8088:8088"   # HEC
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on: [fluent-bit]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+
+volumes:
+  applogs:

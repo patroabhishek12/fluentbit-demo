@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # App metrics, collected BY Fluent Bit and re-exposed on :2021
+  # (includes fluentbit_* internal metrics too)
+  - job_name: fluent-bit
+    honor_labels: true
+    static_configs:
+      - targets: ["fluent-bit:2021"]
